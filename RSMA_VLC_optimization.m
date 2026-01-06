@@ -51,6 +51,48 @@ for k = 1:Nr
     W_current{k+1} = W_current{k+1} * scale_factor;
 end
 
+% 同时满足 LED 幅度约束（避免出现极大 w 导致后续 inf*0->NaN）
+led_bound = min(params.I_DC - params.I_L, params.I_U - params.I_DC);
+max_led_sum = 0;
+for i = 1:Nt
+    led_sum = abs(W_current{1}(i));
+    for k = 1:Nr
+        led_sum = led_sum + abs(W_current{k+1}(i));
+    end
+    max_led_sum = max(max_led_sum, led_sum);
+end
+if max_led_sum > led_bound && max_led_sum > 0
+    sf_led = led_bound / max_led_sum;
+    for k = 0:Nr
+        W_current{k+1} = W_current{k+1} * sf_led;
+    end
+end
+
+% 最后兜底：若仍出现非有限值，重新初始化为满足LED约束的小随机值
+% 这里把所有预编码向量拼成一个列向量用于检查 Inf/NaN
+all_w = vertcat(W_current{:});
+if any(~isfinite(all_w))
+    warning('初始化预编码出现 Inf/NaN，已重置为满足 LED 约束的小随机初值。');
+    W_current{1} = randn(Nt, 1);
+    for k = 1:Nr
+        W_current{k+1} = randn(Nt, 1);
+    end
+    max_led_sum = 0;
+    for i = 1:Nt
+        led_sum = abs(W_current{1}(i));
+        for k = 1:Nr
+            led_sum = led_sum + abs(W_current{k+1}(i));
+        end
+        max_led_sum = max(max_led_sum, led_sum);
+    end
+    if max_led_sum > 0
+        sf_led = led_bound / max_led_sum;
+        for k = 0:Nr
+            W_current{k+1} = W_current{k+1} * sf_led;
+        end
+    end
+end
+
 % 初始化公共速率分配
 C_current = ones(Nr, 1) * 0.01;
 
@@ -67,18 +109,78 @@ while ~converged && iteration < max_iter
     iteration = iteration + 1;
 
     % 解决凸优化子问题 (问题3.20)
-    [W_new, C_new, a_p_new, f_p_new, g_p_new, a_c_new, f_c_new, g_c_new, ~] = ...
-        solve_sca_subproblem(H_est, W_current, C_current, a_p, f_p, g_p, a_c, f_c, g_c, ...
-                           params, P_t, noise_power);
-    
-    % 更新变量
-    W_current = W_new;  % 预编码矩阵
-    C_current = C_new;  % 公共速率分配
-    a_p = a_p_new; f_p = f_p_new; g_p = g_p_new;
-    a_c = a_c_new; f_c = f_c_new; g_c = g_c_new;
-    
-    % 计算实际系统和速率
-    current_sum_rate = calculate_sum_rate(H_real, W_current, C_current, params, noise_power);
+    [W_new, C_new, a_p_new, f_p_new, g_p_new, a_c_new, f_c_new, g_c_new, ~, cvx_status_out] = ...
+        solve_sca_subproblem(H_est, W_current, g_p, g_c, params, P_t, noise_power);
+
+    % 若 CVX 未正常求解，保持上一次可行点，避免把 W 更新成全零/异常值
+    if ~(contains(cvx_status_out, 'Solved') || contains(cvx_status_out, 'Inaccurate/Solved'))
+        warning('CVX 子问题求解状态: %s，保持上一迭代点。', cvx_status_out);
+        current_sum_rate = sum_rate_prev;
+    else
+        % 计算新解的真实系统和速率（注意：SCA 目标与真实 sum-rate 不完全一致，直接更新可能导致真实速率下降甚至掉到 0）
+        current_sum_rate_candidate = calculate_sum_rate(H_real, W_new, C_new, params, noise_power);
+
+        % 阻尼/回溯：若真实 sum-rate 下降，则用凸组合缩步，防止迭代点滑到 W≈0 后被线性化“锁死”
+        accepted = false;
+        best_rate = current_sum_rate_candidate;
+        best_W = W_new;
+        best_C = C_new;
+        best_slack = [];
+
+        if isfinite(current_sum_rate_candidate) && (current_sum_rate_candidate >= sum_rate_prev - 1e-6)
+            accepted = true;
+        else
+            for bt = 1:6
+                alpha = 0.5^bt;
+
+                % blend W
+                W_blend = W_current;
+                for kk = 1:(Nr+1)
+                    W_blend{kk} = (1 - alpha) * W_current{kk} + alpha * W_new{kk};
+                end
+
+                % blend C
+                C_blend = (1 - alpha) * C_current + alpha * C_new;
+
+                % 重新初始化松弛变量（保证与新线性化点一致，避免数值漂移）
+                [a_p_bt, f_p_bt, g_p_bt, a_c_bt, f_c_bt, g_c_bt, C_blend] = initialize_slack_variables(H_est, W_blend, C_blend, params, noise_power);
+
+                rate_bt = calculate_sum_rate(H_real, W_blend, C_blend, params, noise_power);
+                if isfinite(rate_bt) && (rate_bt >= sum_rate_prev - 1e-6)
+                    accepted = true;
+                    best_rate = rate_bt;
+                    best_W = W_blend;
+                    best_C = C_blend;
+                    best_slack = {a_p_bt, f_p_bt, g_p_bt, a_c_bt, f_c_bt, g_c_bt};
+                    break;
+                end
+
+                if isfinite(rate_bt) && rate_bt > best_rate
+                    best_rate = rate_bt;
+                    best_W = W_blend;
+                    best_C = C_blend;
+                    best_slack = {a_p_bt, f_p_bt, g_p_bt, a_c_bt, f_c_bt, g_c_bt};
+                end
+            end
+        end
+
+        if accepted
+            % 接受更新：优先使用回溯后的 best_slack（若未回溯则保持 CVX 输出）
+            W_current = best_W;
+            C_current = best_C;
+            if ~isempty(best_slack)
+                a_p = best_slack{1}; f_p = best_slack{2}; g_p = best_slack{3};
+                a_c = best_slack{4}; f_c = best_slack{5}; g_c = best_slack{6};
+            else
+                a_p = a_p_new; f_p = f_p_new; g_p = g_p_new;
+                a_c = a_c_new; f_c = f_c_new; g_c = g_c_new;
+            end
+            current_sum_rate = best_rate;
+        else
+            % 不接受会导致下降的更新：保持上一点
+            current_sum_rate = sum_rate_prev;
+        end
+    end
     
     % 检查收敛
     if abs(current_sum_rate - sum_rate_prev) < tol
@@ -165,39 +267,32 @@ end
 
 end
 
+%{
+Legacy (unused): compute_taylor_expansion
+
+早期版本用于对照论文(3.15)/(3.18)的泰勒展开项。
+当前实现已改为在 solve_sca_subproblem 内部按“旧点切线下界”直接构造仿射约束，
+因此该函数不再被调用；保留注释块仅供回溯参考。
+
 function [tau_p, tau_c] = compute_taylor_expansion(H_real, W, g_p_old, g_c_old, params)
-% 计算一阶泰勒展开项 (公式3.15和3.18)
-
 Nr = params.Nr;
-% Nt = params.Nt;          % 维度信息（此函数内部未直接使用，仅用于对照论文/调试）
-% M  = size(H_real, 3);    % 样本数（此函数内部使用 mean(H_real,3) 已隐式用到）
-
-% 预编码向量：W = {w0, w1, ..., wNr}
-% w0: 公共流预编码；wk: 用户k私有流预编码
 w0 = W{1};
 w_private = W(2:end);
 
-% 初始化泰勒展开项
 tau_p = zeros(Nr, 1);
 tau_c = zeros(Nr, 1);
 
+H_avg = mean(H_real, 3);
 for k = 1:Nr
-    % 计算平均信道
-    H_avg = mean(H_real, 3);
     hk = H_avg(k, :)';
-    
-    % 计算私有流的泰勒展开 (公式3.15)
-    numerator = 2 * (w_private{k}' * (hk * hk') * w_private{k});
     denom = g_p_old(k);
-    tau_p(k) = numerator / denom - (abs(hk' * w_private{k}) / denom)^2;
-    
-    % 计算公共流的泰勒展开 (公式3.18)
-    numerator_c = 2 * (w0' * (hk * hk') * w0);
-    denom_c = g_c_old(k);
-    tau_c(k) = numerator_c / denom_c - (abs(hk' * w0) / denom_c)^2;
-end
+    tau_p(k) = (2 * (w_private{k}' * (hk * hk') * w_private{k})) / denom - (abs(hk' * w_private{k}) / denom)^2;
 
+    denom_c = g_c_old(k);
+    tau_c(k) = (2 * (w0' * (hk * hk') * w0)) / denom_c - (abs(hk' * w0) / denom_c)^2;
 end
+end
+%}
 
 function sum_rate = calculate_sum_rate(H_real, W, C, params, noise_power)
 % 计算RSMA-VLC系统的实际和速率
@@ -304,9 +399,8 @@ sum_rate = total_sum_rate / M;
 
 end
 
-function [W_opt, C_opt, a_p_opt, f_p_opt, g_p_opt, a_c_opt, f_c_opt, g_c_opt, obj_value] = ...
-    solve_sca_subproblem(H_est, W_current, C_current, a_p_old, f_p_old, g_p_old, a_c_old, f_c_old, g_c_old, ...
-                       params, P_t, noise_power)
+function [W_opt, C_opt, a_p_opt, f_p_opt, g_p_opt, a_c_opt, f_c_opt, g_c_opt, obj_value, cvx_status_out] = ...
+    solve_sca_subproblem(H_est, W_current, g_p_old, g_c_old, params, P_t, noise_power)
 % 解决SCA凸优化子问题 (对应问题3.20)
 
 Nr = params.Nr;
@@ -319,6 +413,54 @@ w0_old = W_current{1};
 w_private_old = zeros(Nt, Nr);
 for k = 1:Nr
     w_private_old(:, k) = W_current{k+1};
+end
+
+% 预计算每个用户的线性化常量（全部为数值常量，避免在 CVX 表达式上调用 isfinite 等函数）
+A_k = cell(Nr, 1);
+v_priv = cell(Nr, 1);   % v_priv{k} = A_k{k} * w_private_old(:,k)
+v_comm = cell(Nr, 1);   % v_comm{k} = A_k{k} * w0_old
+g_p0 = zeros(Nr, 1);
+g_c0 = zeros(Nr, 1);
+num_priv0 = zeros(Nr, 1);
+num_comm0 = zeros(Nr, 1);
+
+for k = 1:Nr
+    hk = H_est(k, :)';
+    if any(~isfinite(hk))
+        hk(:) = 0;
+    end
+    A = hk * hk';
+    if any(~isfinite(A(:)))
+        A(:) = 0;
+    end
+    A_k{k} = A;
+
+    gp = g_p_old(k);
+    if ~isfinite(gp) || gp <= 0
+        gp = noise_power;
+    end
+    g_p0(k) = max(gp, 1e-9);
+
+    gc = g_c_old(k);
+    if ~isfinite(gc) || gc <= 0
+        gc = noise_power;
+    end
+    g_c0(k) = max(gc, 1e-9);
+
+    v_priv{k} = A * w_private_old(:, k);
+    v_comm{k} = A * w0_old;
+
+    nump = real(w_private_old(:, k)' * A * w_private_old(:, k));
+    if ~isfinite(nump) || nump < 0
+        nump = 0;
+    end
+    num_priv0(k) = nump;
+
+    numc = real(w0_old' * A * w0_old);
+    if ~isfinite(numc) || numc < 0
+        numc = 0;
+    end
+    num_comm0(k) = numc;
 end
 
 cvx_begin quiet
@@ -357,8 +499,7 @@ cvx_begin quiet
             exp((log(2)/B) * a_p(k)) <= f_p(k);
             
             % 约束(3.14d): g_p >= 干扰+噪声
-            hk = H_est(k, :)';
-            A = hk * hk';
+            A = A_k{k};
             interference_power = 0;
             for j = 1:Nr
                 if j ~= k
@@ -371,9 +512,10 @@ cvx_begin quiet
             % 目标：f_p - 1 <= |h_k^T w_k|^2 / g_{k,p}
             % 右侧为凸函数的“下界切线”（仿射），在(w_old,g_old)处：
             %   |h^T w|^2/g >= 2*w_old^T A w / g_old - (w_old^T A w_old)/g_old^2 * g
-            g_old = max(g_p_old(k), 1e-9);
-            num_old = w_private_old(:, k)' * A * w_private_old(:, k);
-            (2 * (w_private_old(:, k)' * A * w_private(:, k))) / g_old - (num_old / (g_old^2)) * g_p(k) >= f_p(k) - 1;
+            g_old = g_p0(k);
+            num_old = num_priv0(k);
+            lin_num = real(v_priv{k}' * w_private(:, k));
+            (2 * lin_num) / g_old - (num_old / (g_old^2)) * g_p(k) >= f_p(k) - 1;
         end
         
         % 公共速率约束 (公式3.17a, 3.17b, 3.17c, 3.17e, 3.19)
@@ -389,8 +531,7 @@ cvx_begin quiet
             exp((log(2)/B) * a_c(k)) <= f_c(k);
             
             % 约束(3.17e): g_c >= 总干扰+噪声
-            hk = H_est(k, :)';
-            A = hk * hk';
+            A = A_k{k};
             total_interference = 0;
             for j = 1:Nr
                 total_interference = total_interference + quad_form(w_private(:, j), A);
@@ -399,12 +540,15 @@ cvx_begin quiet
 
             % 约束(3.19): 一阶下界近似后的公共 SINR 约束
             % 目标：f_c - 1 <= |h_k^T w_0|^2 / g_{k,c}
-            g_old = max(g_c_old(k), 1e-9);
-            num_old = w0_old' * A * w0_old;
-            (2 * (w0_old' * A * w0)) / g_old - (num_old / (g_old^2)) * g_c(k) >= f_c(k) - 1;
+            g_old = g_c0(k);
+            num_old = num_comm0(k);
+            lin_num = real(v_comm{k}' * w0);
+            (2 * lin_num) / g_old - (num_old / (g_old^2)) * g_c(k) >= f_c(k) - 1;
         end
         
 cvx_end
+
+cvx_status_out = cvx_status;
 
 % 打包输出
 W_opt = cell(1, Nr+1);

@@ -26,6 +26,13 @@ noise_power = sigma_shot2 + sigma_thermal2;
 % 平均信道增益
 avg_h = mean(abs(H_est(:)).^2);
 
+% 避免 avg_h≈0 导致 P_t 变为 Inf/NaN（例如用户/LED 超出FOV导致信道接近0）
+avg_h_floor = 1e-15;
+if ~isfinite(avg_h) || avg_h < avg_h_floor
+	warning('平均信道增益 avg_h=%.3e 过小/无效，已夹紧到 %.1e 以避免 P_t 变为 Inf。请检查场景/FOV/位置设置。', avg_h, avg_h_floor);
+	avg_h = avg_h_floor;
+end
+
 % 所需发射功率
 P_t = SNR_linear * noise_power / avg_h;
 
